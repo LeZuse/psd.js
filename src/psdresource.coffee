@@ -156,7 +156,7 @@ class PSDResource
 
     1034:
       name: 'Copyright flag'
-      parse: -> [@copyrighted] = @file.readf ">B"
+      parse: -> [@copyrighted] = @file.readf ">#{@size}B"
 
     1035:
       name: 'URL'
@@ -184,7 +184,7 @@ class PSDResource
 
     1041:
       name: 'ICC Untagged'
-      parse: -> [@disableProfile] = @file.readf ">B"
+      #parse: -> [@disableProfile] = @file.readf ">B"
 
     1042:
       name: 'Effects visible'
@@ -360,7 +360,7 @@ class PSDResource
   constructor: (@file) ->
 
   parse: ->
-    @at = @file.tell()
+    @at = @file.tell()  
 
     [@type, @id, @namelen] = @file.readf ">4s H B"
 
@@ -371,16 +371,18 @@ class PSDResource
     @name = @name.substr(0, @name.length - 1)
     @shortName = @name.substr(0, 20)
 
-    [@size] = @file.readf ">L"
+    @size = @file.readInt()
     @size = Util.pad2(@size)
 
-    if 2000 <= @id <= 2997
+    if 2000 <= @id <= 2998
       @rdesc = "[Path Information]"
       @file.seek @size
+    else if @id is 2999
+      assert 0
     else if 4000 <= @id < 5000
       @rdesc = "[Plug-in Resource]"
       @file.seek @size
-    else
+    else if RESOURCE_DESCRIPTIONS[@id]?
       resource = RESOURCE_DESCRIPTIONS[@id]
       @rdesc = "[#{resource.name}]"
 
@@ -388,5 +390,19 @@ class PSDResource
         resource.parse.call(@)
       else
         @file.seek @size
+    else
+      @file.seek @size
 
-    4 + 2 + Util.pad2(1 + @namelen) + 4 + Util.pad2(@size)
+  toJSON: ->
+    sections = [
+      'type'
+      'id'
+      'name'
+      'rdesc'
+    ]
+
+    data = {}
+    for section in sections
+      data[section] = @[section]
+
+    data

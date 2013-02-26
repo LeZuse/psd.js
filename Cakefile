@@ -1,5 +1,5 @@
 fs      = require 'fs'
-{exec}  = require 'child_process'
+{exec, spawn}  = require 'child_process'
 util    = require 'util'
 {jsmin} = require 'jsmin'
 
@@ -8,6 +8,7 @@ targetName    = "psd"
 ###
 CoffeeScript Options
 ###
+strictMode    = false
 csSrcDir      = "src"
 csTargetDir   = "lib"
 
@@ -16,16 +17,42 @@ depsDir        = "deps"
 targetCoffee  = "#{csSrcDir}/build"
 
 targetCoreJS      = "#{csTargetDir}/#{targetName}.js"
-coffeeCoreOpts    = "-r coffeescript-growl -j #{targetName}.js -o #{csTargetDir} -c #{targetCoffee}.coffee"
+targetCoreMinJS   = "#{csTargetDir}/#{targetName}.min.js"
+coffeeCoreOpts    = "-j #{targetName}.js -o #{csTargetDir} -c #{targetCoffee}.coffee"
 
 # All source files listed in include order
 coffeeFiles   = [
+  "psdassert"
+  
   "psd"
+  "psdcolor"
+  "psddescriptor"
   "psdfile"
   "psdheader"
   "psdimage"
+  "psdchannelimage"
   "psdlayer"
   "psdlayermask"
+
+  "layerdata/blackwhite"
+  "layerdata/brightnesscontrast"
+  "layerdata/colorbalance"
+  "layerdata/curves"
+  "layerdata/exposure"
+  "layerdata/gradient"
+  "layerdata/huesaturation"
+  "layerdata/invert"
+  "layerdata/layereffect"
+  "layerdata/levels"
+  "layerdata/pattern"
+  "layerdata/photofilter"
+  "layerdata/posterize"
+  "layerdata/selectivecolor"
+  "layerdata/solidcolor"
+  "layerdata/threshold"
+  "layerdata/typetool"
+  "layerdata/vibrance"
+
   "psdresource"
   "util"
   "log"
@@ -42,17 +69,46 @@ finishListener = (type, cb) ->
   finishedCallback[type] = cb
 
 ###
+Options
+###
+option '-f', '--file [FILE]', 'Test file to load (for debugging)'
+
+###
 Tasks
 ###
+task 'debug', 'Run psd.js in debug mode with node-inspector', (opts) ->
+  throw "Must specify a file with -f" if not opts.file
+
+  debug = spawn 'coffee', ['--nodejs', '--debug-brk', opts.file]
+  debug.stdout.on 'data', (data) -> console.log data
+
+  insp = spawn 'node-inspector'
+  insp.stdout.on 'data', (data) -> util.log data
+
+  exec 'open http://127.0.0.1:8080/debug?port=5858'
+
 task 'docs', 'Generates documentation for the coffee files', ->
   util.log 'Invoking docco on the CoffeeScript source files'
   
   files = coffeeFiles
   files[i] = "#{csSrcDir}/#{files[i]}.coffee" for i in [0...files.length]
 
-  exec "docco #{files.join(' ')}", (err, stdout, stderr) ->
+  exec "./node_modules/docco/bin/docco #{files.join(' ')}", (err, stdout, stderr) ->
     util.log err if err
     util.log "Documentation built into docs/ folder."
+
+task 'test', 'Run all unit tests', ->
+  reporter = require('nodeunit').reporters.default
+  process.chdir __dirname
+
+  console.log "=> Running unit tests"
+  reporter.run ['test/unit_tests'], null, ->
+
+    {TargetPractice} = require './test/targetpractice'
+    tp = new TargetPractice "psd.tp/**/*.json"
+
+    console.log "\n=> Running TargetPractice"
+    tp.runTests()
         
 task 'watch', 'Automatically recompile the CoffeeScript files when updated', ->
   util.log "Watching for changes in #{csSrcDir}"
@@ -64,10 +120,10 @@ task 'watch', 'Automatically recompile the CoffeeScript files when updated', ->
         invoke 'build'
         
 task 'build', 'Compile and minify all CoffeeScript source files', ->
-  finishListener 'js', ->
+  finishListener 'js', -> invoke 'minify'
   invoke 'compile'
 
-task 'compile', 'Compile all CoffeeScript source files', ->
+task 'compile', 'Compile all CoffeeScript source files', (opts) ->
   util.log "Building #{targetCoreJS}"
   contents = []
   remaining = coffeeFiles.length
@@ -89,12 +145,14 @@ task 'compile', 'Compile all CoffeeScript source files', ->
       util.log "Adding dependency #{dep}"
       contents.unshift "`" + fs.readFileSync("#{depsDir}/#{dep}", "utf8") + "`\n\n"
 
+    contents.unshift fs.readFileSync("#{csSrcDir}/license.coffee") + "\n\n"
+    contents.unshift "\"use strict\"" if strictMode
     core = contents.join("\n\n")
 
     fs.writeFile "#{targetCoffee}.coffee", core, "utf8", (err) ->
       util.log err if err
       
-      exec "coffee #{coffeeCoreOpts}", (err, stdout, stderr) ->
+      exec "./node_modules/.bin/coffee #{coffeeCoreOpts}", (err, stdout, stderr) ->
         util.log err if err
         util.log "Compiled #{targetCoreJS}"
         fs.unlink "#{targetCoffee}.coffee"

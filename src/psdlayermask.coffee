@@ -1,5 +1,5 @@
 class PSDLayerMask
-  constructor: (@file, @header) ->
+  constructor: (@file, @header, @options) ->
     # Array to hold all of the layers
     @layers = []
 
@@ -12,71 +12,103 @@ class PSDLayerMask
     # Additional layer information
     @extras = []
 
+  # Skip over this section and don't parse it
+  skip: -> @file.seek @file.readInt()
+
   parse: ->
     # Read the size of the entire layers and masks section
-    maskSize = @file.readUInt()
+    maskSize = @file.readInt()
     endLoc = @file.tell() + maskSize
-
-    # Store the current position in case we need to bail
-    # and skip over this section.
-    pos = @file.tell()
 
     Log.debug "Layer mask size is #{maskSize}"
 
     # If the mask size is > 0, then parse the section. Otherwise,
     # this section doesn't exist and the whole layers/masks data
     # is 4 bytes (the length we've already read)
-    if maskSize > 0
-      # Size of the layer info section. 4 bytes, rounded up by 2's.
-      layerInfoSize = Util.pad2(@file.readUInt())
+    return if maskSize <= 0
+    
+    # Size of the layer info section. 4 bytes, rounded up by 2's.
+    layerInfoSize = Util.pad2 @file.readInt()
 
-      # If the layer info size is > 0, then we have some layers
-      if layerInfoSize > 0
-        # Read the number of layers, 2 bytes.
-        @numLayers = @file.readShortInt()
+    # Store the current position in case we need to bail
+    # and skip over this section.
+    pos = @file.tell()
 
-        # If the number of layers is negative, the absolute value is
-        # the actual number of layers, and the first alpha channel contains
-        # the transparency data for the merged image.
-        if @numLayers < 0
-          Log.debug "Note: first alpha channel contains transparency data"
-          @numLayers = Math.abs @numLayers
-          @mergedAlpha = true
+    # If the layer info size is > 0, then we have some layers
+    if layerInfoSize > 0
+      # Read the number of layers, 2 bytes.
+      @numLayers = @file.readShortInt()
 
-        if @numLayers * (18 + 6 * @header.channels) > layerInfoSize
-          throw "Unlikely number of #{@numLayers} layers for #{@header['channels']} with #{layerInfoSize} layer info size. Giving up."
+      # If the number of layers is negative, the absolute value is
+      # the actual number of layers, and the first alpha channel contains
+      # the transparency data for the merged image.
+      if @numLayers < 0
+        Log.debug "Note: first alpha channel contains transparency data"
+        @numLayers = Math.abs @numLayers
+        @mergedAlpha = true
 
-        Log.debug "Found #{@numLayers} layer(s)"
+      if @numLayers * (18 + 6 * @header.channels) > layerInfoSize
+        throw "Unlikely number of #{@numLayers} layers for #{@header['channels']} with #{layerInfoSize} layer info size. Giving up."
 
-        for i in [0...@numLayers]
-          layer = new PSDLayer @file
-          layer.parse(i)
-          @layers.push layer
+      Log.debug "Found #{@numLayers} layer(s)"
+
+      for i in [0...@numLayers]
+        layer = new PSDLayer @file
+        layer.parse(i)
+        @layers.push layer
+
+      for layer in @layers
+        if layer.isFolder or layer.isHidden
+          # Layer contains no image data. Skip ahead.
+          @file.seek 8
+          continue
+
+        layer.image = new PSDChannelImage(@file, @header, layer)
+
+        if @options.layerImages and (
+          (@options.onlyVisibleLayers and layer.visible) or
+          !@options.onlyVisibleLayers
+          )
+          layer.image.parse()
+        else
+          layer.image.skip()
+
+      # Layers are parsed in reverse order
+      @layers.reverse()
+      @groupLayers()
+
+    # In case there are filler zeros
+    @file.seek pos + layerInfoSize, false
+
+    # Parse the global layer mask
+    @parseGlobalMask()
 
     # Temporarily skip the rest of layers & masks section
     @file.seek endLoc, false
     return
 
-    # Parse the global layer mask
-    @parseGlobalMask()
-
     # We have more additional info to parse, especially beacuse this is PS >= 4.0
-    @parseExtraInfo(endLoc) if @file.tell() < endLoc
+    #@parseExtraInfo(endLoc) if @file.tell() < endLoc
 
   parseGlobalMask: ->
     length = @file.readInt()
+    return if length is 0
+
+    start = @file.tell()
     end = @file.tell() + length
 
     Log.debug "Global mask length: #{length}"
 
-    # This is undocumented, so we just read the bytes and store them for now
-    @globalMask.overlayColorSpace = @file.read(2)
+    # Undocumented
+    @globalMask.overlayColorSpace = @file.readShortInt()
 
-    # This isn't well documented either. We know its 4 * 2 byte color components
-    # of some kind though.
-    @globalMask.colorComponents = @file.readf ">HHHH"
+    # TODO: parse color space components into actual color.
+    @globalMask.colorComponents = []
+    for i in [0...4]
+      @globalMask.colorComponents.push(@file.readShortInt() >> 8)
 
-    @globalMask.opacity = @file.readShortUInt()
+    # 0 = transparent, 100 = opaque
+    @globalMask.opacity = @file.readShortInt()
 
     # 0 = color selected; 1 = color protected; 128 = use value per layer
     @globalMask.kind = @file.read(1)[0]
@@ -102,14 +134,24 @@ class PSDLayerMask
       @file.seek length
 
   groupLayers: ->
-    parents = []
+    groupLayer = null
     for layer in @layers
-      layer.parent = parents[parents.length - 1] or null
-      layer.parents = parents[1..]
-
-      continue if layer.layerType.code is 0
-
-      if layer.layerType.code is 3 and parents.length > 0
-        delete parents[parents.length - 1]
+      if layer.isFolder
+        groupLayer = layer
+      else if layer.isHidden
+        groupLayer = null
       else
-        parents.push layer
+        layer.groupLayer = groupLayer
+
+  toJSON: ->
+    data =
+      mergedAlpha: @mergedAlpha
+      globalMask: @globalMask
+      extraInfo: @extras
+      numLayers: @numLayers
+      layers: []
+
+    for layer in @layers
+      data.layers.push layer.toJSON()
+
+    data
