@@ -4,6 +4,8 @@
 # but some of them are helper functions to make things a bit easier to
 # understand.
 class PSDFile
+  unicodeRegex: /\\u([\d\w]{4})/gi
+
   constructor: (@data) ->
     # Track our current position in the file data. This is analogous to the
     # file pointer in C.
@@ -21,25 +23,33 @@ class PSDFile
   # causes the file pointer to move to the absolute location specified.
   seek: (amount, rel = true) ->
     if rel then @pos += amount else @pos = amount
-      
-  # Helper function to read an unsigned 16-bit integer
-  readUInt16: ->
-    b1 = @data[@pos++] << 8
-    b2 = @data[@pos++]
-    b1 | b2
 
   #
   # Helper functions so we don't have to remember the unpack
   # format codes.
   #
   
-  # 4 bytes
-  readInt: -> @readf(">i")[0]
-  readUInt: -> @readf(">I")[0]
+  # 4 bytes / 32-bit
+  readInt: ->
+    int = @readUInt()
+    if int >= 0x80000000 then int - 0x100000000 else int
+
+  readUInt: ->
+    b1 = @read(1)[0] << 24
+    b2 = @read(1)[0] << 16
+    b3 = @read(1)[0] << 8
+    b4 = @read(1)[0]
+    b1 | b2 | b3 | b4
 
   # 2 bytes
-  readShortInt: -> @readf(">h")[0]
-  readShortUInt: -> @readf(">H")[0]
+  readShortInt: ->
+    int = @readShortUInt()
+    if int >= 0x8000 then int - 0x10000 else int
+
+  readShortUInt: ->
+    b1 = @read(1)[0] << 8
+    b2 = @read(1)[0]
+    b1 | b2
 
   # 4 bytes
   readLongInt: -> @readf(">l")[0]
@@ -51,31 +61,26 @@ class PSDFile
   # 1 byte
   readBoolean: -> @read(1)[0] isnt 0
 
-  readUnicodeString: (strlen = null) ->
-    str = ""
-    strlen = @readUInt() if not strlen
-    for i in [0...strlen]
-      charCode = @readShortUInt()
-      str += chr(Util.i16(charCode)) if charCode > 0
+  # Unfortunately Javascript does not support 64-bit integers, so we
+  # have a temporary solution for now. In the future, we can parse and
+  # store the int either as an octet string, or something more useful.
+  readLongLong: -> @read(8)
+  readULongLong: -> @read(8)
 
-    str
+  # Reads a string with the given length. Because some strings are also
+  # null-byte padded, we strip out these null bytes since they are of no
+  # use to us in Javascript.
+  readString: (length) ->
+    ret = String.fromCharCode.apply null, @read(length)
+    ret.replace /\u0000/g, ""
 
-  # Parses the structure of a descriptor
-  readDescriptorStructure: ->
-    name = @readUnicodeString()
-    classID = @readLengthWithString()
-    items = @readUInt()
+  readUnicodeString: ->
+    len = @readInt() * 2
+    str = @readf(">#{len}s")[0]
+    str = str.replace @unicodeRegex, (match, grp) ->
+      String.fromCharCode parseInt(grp, 16)
 
-    descriptors = {}
-    for i in [0...items]
-      key = @readLengthWithString().trim()
-      descriptors[key] = @readOsType()
-
-    descriptors
-
-  # Reads a string with the given length. Note that the length is given in 
-  # bytes, not characters.
-  readString: (length) -> @readf ">#{length}s"
+    str.replace /\u0000/g, ""
 
   # Used for reading pascal strings, which are strings that have their length 
   # prepended to the chunk of character bytes. If a length isn't found, a 
@@ -89,69 +94,16 @@ class PSDFile
 
     str
 
-  # Parses a special OS variable type
-  readOsType: ->
-    osType = @readString(4)
-    value = null
-    switch osType
-      when "TEXT" then value = @readUnicodeString()
-      when "enum", "Objc", "GlbO"
-        value =
-          typeID: @readLengthWithString()
-          enum: @readLengthWithString()
-      when "VlLs"
-        listSize = @readUInt()
-        value = []
-        value.push(@readOsType()) for i in [0...listSize]
-      when "doub" then value = @readDouble()
-      when "UntF"
-        value =
-          type: @readString(4)
-          value: @readDouble()
-      when "long" then value = @readUInt()
-      when "bool" then value = @readBoolean()
-      when "alis"
-        length = @readUInt()
-        value = @readString(length)
-      when "obj"
-        num = @readUInt()
-        for i in [0...num]
-          type = @readString(4)
-          switch type
-            when "prop"
-              value =
-                name: @readUnicodeString()
-                classID: @readLengthWithString()
-                keyID: @readLengthWithString()
-            when "Clss"
-              value =
-                name: @readUnicodeString()
-                classID: @readLengthWithString()
-            when "Enmr"
-              value =
-                name: @readUnicodeString()
-                classID: @readLengthWithString()
-                typeID: @readLengthWithString()
-                enum: @readLengthWithString()
-            when "rele"
-              value =
-                name: @readUnicodeString()
-                classID: @readLengthWithString()
-                offsetValue: @readUInt()
-            when "Idnt", "indx", "name" then value = null
-      when "tdta"
-        # Skip this
-        length = @readUInt()
-        @seek length
-
-    {type: osType, value: value}
-
   # Reads a byte list
-  readBytesList: (size) ->
-    bytesRead = @read size
-    result = []
-    result.push ord(b) for b in bytesRead
-    result
+  readBytesList: (size) -> @read size
+
+  readSpaceColor: ->
+    colorSpace = @readShortInt()
+
+    colorComponent = []
+    colorComponent.push @readShortInt() >> 8 for i in [0...4]
+    PSDColor.colorSpaceToARGB(colorSpace, colorComponent)
+    
   
   # Reads from the file given the unpack format string. Format string codes 
   # can be easily referenced 

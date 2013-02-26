@@ -18,7 +18,7 @@ class PSDLayer
     0: "other"
     1: "open folder"
     2: "closed folder"
-    3: "bounding section divider"
+    3: "bounding section divider" # hidden in the UI
 
   BLEND_MODES =
     "norm": "normal"
@@ -69,17 +69,29 @@ class PSDLayer
   ]
 
   constructor: (@file, @header = null) ->
-    @images = []
+    @image = null
     @mask = {}
     @blendingRanges = {}
+    @adjustments = {}
+
+    # Defaults
+    @layerType = "normal"
+    @blendingMode = "normal"
+    @opacity = 255
+    @fillOpacity = 255
+
+    @isFolder = false
+    @isHidden = false
 
   parse: (layerIndex = null) ->
     @parseInfo(layerIndex)
     @parseBlendModes()
 
     # Length of the rest of the layer data
-    extralen = @file.readUInt()
+    extralen = @file.readInt()
     @layerEnd = @file.tell() + extralen
+
+    assert extralen > 0
 
     # Marking our start point in case we need to bail and recover
     extrastart = @file.tell()
@@ -87,20 +99,19 @@ class PSDLayer
     result = @parseMaskData()
     if not result
       # Make this more graceful in the future?
-      throw "Error parsing mask data for layer ##{@idx}. Quitting"
+      Log.debug "Error parsing mask data for layer ##{layerIndex}. Skipping."
+      return @file.seek @layerEnd, false
 
     @parseBlendingRanges()
+    @parseLegacyLayerName()
+    @parseExtraData()
 
-    namelen = Util.pad4 @file.read(1)[0]
-    @name = @file.readString namelen
+    @name = @legacyName unless @name?
 
-    Log.debug "Layer name: #{@name}"
+    Log.debug "Layer #{layerIndex}:", @
 
-    # Channel image data
-    #@parseImageData()
-  
-    # Skip to end of layer and ignore the channel image data for now
-    @file.seek @layerEnd, false
+    # In case there are filler zeros
+    @file.seek extrastart + extralen, false
 
   # Parse important information about this layer such as position, size,
   # and channel info. Layer Records section.
@@ -110,10 +121,14 @@ class PSDLayer
     ###
     Layer Info
     ###
-    [@top, @left, @bottom, @right, @channels] = @file.readf ">LLLLH"
+    [@top, @left, @bottom, @right, @channels] = @file.readf ">iiiih"
     [@rows, @cols] = [@bottom - @top, @right - @left]
 
-    Log.debug "Layer #{@idx}:", @
+    assert @channels > 0
+
+    # Alias
+    @height = @rows
+    @width = @cols
 
     # Sanity check
     if @bottom < @top or @right < @left or @channels > 64
@@ -125,35 +140,50 @@ class PSDLayer
     # Read channel info
     @channelsInfo = []
     for i in [0...@channels]
-      [channelID, channelLength] = @file.readf ">hL"
+      [channelID, channelLength] = @file.readf ">hi"
       Log.debug "Channel #{i}: id=#{channelID}, #{channelLength} bytes, type=#{CHANNEL_SUFFIXES[channelID]}"
 
-      @channelsInfo.push [channelID, channelLength]
+      @channelsInfo.push id: channelID, length: channelLength
     
   # Parse the blend mode used for this layer including type and opacity
   parseBlendModes: ->
     @blendMode = {}
 
     [
-      @blendMode.sig, 
-      @blendMode.key, 
-      @blendMode.opacity, 
-      @blendMode.clipping, 
-      @blendMode.flags, 
-      @blendMode.filler # unused data
+      @blendMode.sig, # 8BIM
+      @blendMode.key, # blending mode key
+      @blendMode.opacity, # 0 - 255
+      @blendMode.clipping, # 0 = base, 1 = non-base
+      flags, 
+      filler # unused data
     ] = @file.readf ">4s4sBBBB"
+
+    assert @blendMode.sig is "8BIM"
 
     @blendMode.key = @blendMode.key.trim()
     @blendMode.opacityPercentage = (@blendMode.opacity * 100) / 255
     @blendMode.blender = BLEND_MODES[@blendMode.key]
 
+    @blendMode.transparencyProtected = flags & 0x01
+    @blendMode.visible = (flags & (0x01 << 1)) > 0
+    @blendMode.visible = 1 - @blendMode.visible
+    @blendMode.obsolete = (flags & (0x01 << 2)) > 0
+    
+    # PS >= 5.0; tells if bit 4 has useful info
+    if (flags & (0x01 << 3)) > 0
+      @blendMode.pixelDataIrrelevant = (flags & (0x01 << 4)) > 0
+
+    @blendingMode = @blendMode.blender
+    @opacity = @blendMode.opacity
+    @visible = @blendMode.visible
+
     Log.debug "Blending mode:", @blendMode
 
   parseMaskData: ->
-    @mask.size = @file.readUInt()
+    @mask.size = @file.readInt()
 
     # Something wrong, bail.
-    return false if @mask.size not in [36, 20, 0]
+    assert @mask.size in [36, 20, 0]
 
     # Valid, but this section doesn't exist.
     return true if @mask.size is 0
@@ -167,261 +197,180 @@ class PSDLayer
 
       # Either 0 or 255
       @mask.defaultColor, 
-      @mask.flags
-    ] = @file.readf ">LLLLBB"
+      flags
+    ] = @file.readf ">llllBB"
+
+    assert @mask.defaultColor in [0, 255]
+
+    @mask.width = @mask.right - @mask.left
+    @mask.height = @mask.bottom - @mask.top
+
+    @mask.relative = flags & 0x01
+    @mask.disabled = (flags & (0x01 << 1)) > 0
+    @mask.invert = (flags & (0x01 << 2)) > 0
 
     # If the size is 20, then there are 2 bytes of padding
     if @mask.size is 20
       @file.seek(2)
     else
-      # This is weird. Not sure what "real" means in the spec.
+      # This is weird.
       [
-        @mask.realFlags,
-        @mask.realMaskBackground
+        flags,
+        @mask.defaultColor
       ] = @file.readf ">BB"
 
-    # For some reason the mask position info is duplicated here? Skip.
-    @file.seek 16
+      # Real flags. Same as above. Seriously, who designed this crap?
+      @mask.relative = (flags & 0x01)
+      @mask.disabled = (flags & (0x01 << 1)) > 0
+      @mask.invert = (flags & (0x01 << 2)) > 0
+
+      # For some reason the mask position info is duplicated here? Skip. Ugh.
+      @file.seek 16
+
     true
 
   parseBlendingRanges: ->
-    length = @file.readUInt()
+    length = @file.readInt()
 
     # First, the grey blend. This is irrelevant for Lab & Greyscale.
     @blendingRanges.grey =
       source:
-        black: @file.readf ">BB"
-        white: @file.readf ">BB"
+        black: @file.readShortInt()
+        white: @file.readShortInt()
       dest:
-        black: @file.readf ">BB"
-        white: @file.readf ">BB"
+        black: @file.readShortInt()
+        white: @file.readShortInt()
 
     pos = @file.tell()
+
+    @blendingRanges.numChannels = (length - 8) / 8
+    assert @blendingRanges.numChannels > 0
 
     @blendingRanges.channels = []
-    while @file.tell() < pos + length - 8
+    for i in [0...@blendingRanges.numChannels]
       @blendingRanges.channels.push
-        source: @file.readf ">BB"
-        dest: @file.readf ">BB"
+        source: 
+          black: @file.readShortInt()
+          white: @file.readShortInt()
+        dest: 
+          black: @file.readShortInt()
+          white: @file.readShortInt()
 
-    Log.debug "Blending ranges:", @blendingRanges
+  # Parse the name of this layer. This is considered the "legacy"
+  # name because it is encoded with MacRoman encoding. PS >= 5.0
+  # includes a unicode version of the name, which is in the additional
+  # layer information section.
+  parseLegacyLayerName: ->
+    # Name length is padded in multiples of 4
+    namelen = Util.pad4 @file.read(1)[0]
+    @legacyName = Util.decodeMacroman(@file.read(namelen)).replace /\u0000/g, ''
 
   parseExtraData: ->
-    [
-      @signature,
-      @key
-    ] = @file.readf ">4s4s"
-
-    length = @file.readUInt()
-    pos = @file.tell()
-
-  parseImageData: ->
-    # From here to the end of the layer, it's all image data
     while @file.tell() < @layerEnd
-      @compression = @file.readShortInt()
+      [
+        signature,
+        key
+      ] = @file.readf ">4s4s"
 
-      #Log.debug "Image compression: id=#{@compression.id}, name=#{@compression.name}"
-      #@image = new PSDImage @file, @compression
-      #@image.parse()
+      assert.equal signature, "8BIM"
 
-  readMetadata: ->
-    Log.debug "Parsing layer metadata..."
+      length = Util.pad2 @file.readInt()
+      pos = @file.tell()
 
-    count = @file.readUInt16()
+      # TODO: many more adjustment layers to implement
+      Log.debug("Extra layer info: key = #{key}, length = #{length}")
+      switch key
+        when "SoCo"
+          @adjustments.solidColor = (new PSDSolidColor(@, length)).parse()
+        when "GdFl"
+          @adjustments.gradient = (new PSDGradient(@, length)).parse()
+        when "PtFl"
+          @adjustments.pattern = (new PSDPattern(@, length)).parse()
+        when "brit"
+          @adjustments.brightnessContrast = (new PSDBrightnessContrast(@, length)).parse()
+        when "levl"
+          @adjustments.levels = (new PSDLevels(@, length)).parse()
+        when "curv"
+          @adjustments.curves = (new PSDCurves(@, length)).parse()
+        when "expA"
+          @adjustments.exposure = (new PSDExposure(@, length)).parse()
+        when "vibA"
+          @adjustments.vibrance = (new PSDVibrance(@, length)).parse()
+        when "hue2" # PS >= 5.0
+          @adjustments.hueSaturation = (new PSDHueSaturation(@, length)).parse()
+        when "blnc"
+          @adjustments.colorBalance = (new PSDColorBalance(@, length)).parse()
+        when "blwh"
+          @adjustments.blackWhite = (new PSDBlackWhite(@, length)).parse()
+        when "phfl"
+          @adjustments.photoFilter = (new PSDPhotoFilter(@, length)).parse()
+        when "thrs"
+          @adjustments.threshold = (new PSDThreshold(@, length)).parse()
+        when "nvrt"
+          @adjustments.invert = (new PSDInvert(@, length)).parse()
+        when "post"
+          @adjustments.posterize = (new PSDPosterize(@, length)).parse()
+        when "tySh" # PS <= 5
+          @adjustments.typeTool = (new PSDTypeTool(@, length)).parse(true)
+        when "TySh" # PS >= 6
+          @adjustments.typeTool = (new PSDTypeTool(@, length)).parse()
+        when "luni" # PS >= 5.0
+          @name = @file.readUnicodeString()
 
-    for i in [0...count]
-      [sig, key, padding] = @file.readf ">4s4s4s"
+          # This seems to be padded with null bytes (by 4?), but the easiest
+          # thing to do is to simply jump to the end of this section.
+          @file.seek pos + length, false
+        when "lyid"
+          @layerId = @file.readInt()
+        when "lsct"
+          @readLayerSectionDivider()
+        when "lrFX" # PS 5.0
+          @adjustments.legacyEffects = (new PSDEffectsInfo(@, length)).parseLegacy()
+          @file.read(2) # why these 2 bytes?
+        when "lfx2" # PS 6.0
+          @adjustments.effects = (new PSDEffectsInfo(@, length)).parse()
+        when "selc"
+          @adjustments.selectiveColor = (new PSDSelectiveColor(@, length)).parse()
+        else  
+          @file.seek length
+          Log.debug("Skipping additional layer info with key #{key}")
 
-      #if key is "mlst"
-        #readAnimation. needs research.
+      if @file.tell() != (pos + length)
+        Log.debug "Warning: additional layer info with key #{key} - unexpected end. Position = #{@file.tell()}, Expected = #{(pos + length)}"
+        @file.seek pos + length, false # Attempt to recover
 
-      @file.skipBlock("image metadata")
         
   readLayerSectionDivider: ->
-    code = @file.readUInt16()
+    code = @file.readInt()
     @layerType = SECTION_DIVIDER_TYPES[code]
-    
-  readVectorMask: ->
-    version = @file.readUInt()
-    flags = @file.read 4
 
-    # TODO read path information
+    Log.debug "Layer type:", @layerType
 
-  readTypeTool: ->
-    ver = @file.readShortUInt()
-    transforms = []
-    transforms.push @file.readDouble() for i in [0...6]
+    switch code
+      when 1, 2 then @isFolder = true
+      when 3 then @isHidden = true
 
-    textVer = @file.readShortUInt()
-    descrVer = @file.readUInt()
-    return if ver isnt 1 or textVer isnt 50 or descrVer isnt 16
+  toJSON: ->
+    sections = [
+      'name'
+      'legacyName'
+      'top'
+      'left'
+      'bottom'
+      'right'
+      'channels'
+      'rows'
+      'cols'
+      'channelsInfo'
+      'mask'
+      'layerType'
+      'blendMode'
+      'adjustments'
+      'visible'
+    ]
 
-    textData = @file.readDescriptorStructure()
+    data = {}
+    for section in sections
+      data[section] = @[section]
 
-    wrapVer = @readShortUInt()
-    descrVer = @readUInt()
-    wrapData = @file.readDescriptorStructure()
-
-    rectangle = []
-    rectangle.push @file.readDouble() for i in [0...4]
-
-    @textData = textData
-    @wrapData = wrapData
-
-    styledText = []
-    psDict = @textData.EngineData.value
-    text = psDict.EngineDict.Editor.Text
-    styleRun = psDict.EngineDict.StyleRun
-    stylesList = styleRun.RunArray
-    stylesRunList = styleRun.RunLengthArray
-
-    fontsList = psDict.DocumentResources.FontSet
-    start = 0
-    for own i, style of stylesList
-      st = style.StyleSheet.StyleSheetData
-      end = parseInt(start + stylesRunList[i], 10)
-      fontI = st.Font
-      fontName = fontsList[fontI].Name
-      safeFontName = @getSafeFont(fontName)
-
-      color = []
-      color.push(255*j) for j in st.FillColor.Values[1..]
-
-      lineHeight = if st.Leading is 1500 then "Auto" else st.Leading
-      piece = text[start...end]
-      styledText.push
-        text: piece
-        style:
-          font: safeFontName
-          size: st.FontSize
-          color: Util.rgbToHex("rgb(#{color[0]}, #{color[1]}, #{color[2]})")
-          underline: st.Underline
-          allCaps: st.FontCaps
-          italic: !!~ fontName.indexOf("Italic") or st.FauxItalic
-          bold: !!~ fontName.indexOf("Bold") or st.FauxBold
-          letterSpacing: st.Tracking / 20
-          lineHeight: lineHeight
-          paragraphEnds: piece.substr(-1) in ["\n", "\r"]
-
-      start += stylesRunList[i]
-
-    @styledText = styledText
-
-  getSafeFont: (font) ->
-    for safeFont in SAFE_FONTS
-      it = true
-      for word in safeFont.split " "
-        it = false if not !!~ font.indexOf(word)
-
-      return safeFont if it
-
-    font
-
-  getImageData: (readPlaneInfo = true, lineLengths = []) ->
-    @channels =
-      a: []
-      r: []
-      g: []
-      b: []
-
-    opacityDivider = @opacity / 255
-
-    for own i, channelTuple of @channelsInfo
-      [channelId, length] = channelTuple
-      if channelId < -1
-        width = @mask.cols
-        height = @mask.rows
-      else
-        width = @cols
-        height = @rows
-
-      channel = @readColorPlane readPlaneInfo, lineLengths, i, height, width
-      switch channelId
-        when -1
-          @channels.a = []
-          @channels.a.push (ch * opacityDivider) for ch in channel
-        when 0 then @channels.r = channel
-        when 1 then @channels.g = channel
-        when 2 then @channels.b = channel
-        else
-          result = []
-          for i in [0...channel.length]
-            result.push @channels.a[i] * (channel[i]/255)
-
-          @channels.a = result
-
-    @makeImage()
-
-  readColorPlane: (readPlaneInfo, lineLengths, planeNum, height, width) ->
-    size = width * height
-    imageData = []
-    rleEncoded = false
-
-    if readPlaneInfo
-      compression = @file.readShortUInt()
-      Log.debug "Compression: id=#{compression}, name=#{COMPRESSIONS[compression]}"
-
-      rleEncoded = compression is 1
-      if rleEncoded
-        if not lineLengths
-          lineLengths = []
-          lineLengths.push @file.readShortUInt() for a in [0...height]
-      else
-        Log.debug "ERROR: compression not implemented yet. Skipping."
-
-      planeNum = 0
-    else
-      rleEncoded = lineLengths.length isnt 0
-
-    if rleEncoded
-      imageData = @readPlaneCompressed lineLengths, planeNum, height, width
-    else
-      imageData = @file.readBytesList(size)
-
-    imageData
-
-  readPlaneCompressed: (lineLengths, planeNum, height, width) ->
-    b = []
-    b.push 0 for x in [0...(width*height)]
-    s = []
-    pos = 0
-    lineIndex = planeNum * height
-
-    for i in [0...height]
-      len = lineLengths[lineIndex]
-      lineIndex++
-      s = @file.readBytesList(len)
-      @decodeRLE s, 0, len, b, pos
-      pos += width
-
-    b
-
-  decodeRLE: (src, sindex, slen, dst, dindex) ->
-    max = sindex + slen
-
-    while sindex < max
-      b = src[sindex]
-      sindex++
-      n = b
-      if b > 127
-        n = 255 - n + 2
-        b = src[sindex]
-        sindex++
-        for i in [0...n]
-          dst[dindex] = b
-          dindex++
-      else
-        n++
-        dst[dindex...dindex+n] = src[sindex...sindex+n]
-        dindex += n
-        sindex += n
-
-  makeImage: ->
-    return if not @cols? or not @rows?
-
-    type = if isNaN(@channels.a[0]) then "RGB" else "RGBA"
-    image = new PSDImage(type, @cols, @rows, @channels)
-    
-    Log.debug "Image: type=#{type}, width=#{@cols}, height=#{@rows}"
-
-    @images.push image
+    data
